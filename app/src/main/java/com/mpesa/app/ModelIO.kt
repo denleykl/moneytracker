@@ -11,7 +11,10 @@ class TfidfBlock(
     val idf: FloatArray,
     /** coef[term][class] */
     val coef: Array<FloatArray>,
-)
+) {
+    /** term text by index (for explanations) */
+    val terms: Array<String> by lazy { Array(idf.size) { "" }.also { a -> index.forEach { (t, i) -> a[i] = t } } }
+}
 
 class NumericFeature(val name: String, val min: Float, val scale: Float, val coef: FloatArray)
 

@@ -1,7 +1,7 @@
 package com.mpesa.app
 
 /** Where a row's category came from. */
-enum class Source { MODEL, USER, KNOWN, RULE }
+enum class Source { MODEL, USER, KNOWN, RULE, PATTERN }
 
 /** One transaction with its final category. */
 class Categorised(
@@ -11,6 +11,11 @@ class Categorised(
     val confidence: Double,
     val source: Source,
     val needsReview: Boolean,
+    /** the cleaned text and numeric inputs the model saw (kept so "Why?" can be answered later) */
+    val text: String = "",
+    val numeric: Map<String, Double> = emptyMap(),
+    /** one-sentence reason for pattern-based decisions (price bands, restocking) */
+    val why: String = "",
 )
 
 /** One question for the user: "what is this person/shop?" Covers every transaction with that counterparty. */
@@ -21,6 +26,8 @@ class ReviewItem(
     val totalAmount: Double,
     val suggested: String,
     val confidence: Double,
+    /** people are never matched by name similarity */
+    val isPerson: Boolean = false,
 )
 
 /** Remembers what the user said about each counterparty. On Android back it with SharedPreferences or Room. */
@@ -89,6 +96,7 @@ object ReviewEngine {
         threshold: Double = DEFAULT_THRESHOLD,
         known: KnownMerchants? = null,
         useRules: Boolean = true,
+        business: BusinessProfile? = null,
     ): List<Categorised> {
         val feats = FeatureBuilder.build(txs)                 // whole statement at once
         return txs.indices.map { i ->
@@ -96,19 +104,47 @@ object ReviewEngine {
             val user = corrections.get(f.counterparty)
             val hand = if (user == null) known?.lookup(tx) else null
             when {
-                user != null -> Categorised(tx, f.counterparty, user, 1.0, Source.USER, false)
-                hand != null -> Categorised(tx, f.counterparty, hand, 1.0, Source.KNOWN, false)
+                user != null -> Categorised(tx, f.counterparty, user, 1.0, Source.USER, false, f.text, f.numeric)
+                hand != null -> Categorised(tx, f.counterparty, hand, 1.0, Source.KNOWN, false, f.text, f.numeric)
+                business?.match(tx, f.counterparty) != null -> {
+                    val m = business.match(tx, f.counterparty)!!
+                    Categorised(tx, f.counterparty, "Business - Sales income", m.confidence, Source.PATTERN, m.confidence < threshold, f.text, f.numeric, m.why)
+                }
                 else -> {
                     val p = classifier.predict(f.text, f.numeric)
-                    if (p.confidence >= threshold) return@map Categorised(tx, f.counterparty, p.label, p.confidence, Source.MODEL, false)
+                    val sup = business?.supplierHint(tx, f.counterparty)
+                    if (sup != null && (p.confidence < sup.confidence || p.label == "Person-to-Person"))
+                        return@map Categorised(tx, f.counterparty, "Business - Stock", sup.confidence, Source.PATTERN, true, f.text, f.numeric, sup.why)
+                    if (p.confidence >= threshold) return@map Categorised(tx, f.counterparty, p.label, p.confidence, Source.MODEL, false, f.text, f.numeric)
                     val hit = if (useRules && tx.txGroup !in personGroups) Rules.suggest(tx.txGroup, tx.name) else null
                     when {
-                        hit != null && hit.confidence == Confidence.HIGH -> Categorised(tx, f.counterparty, hit.category, 0.85, Source.RULE, false)
-                        hit != null && hit.category == p.label -> Categorised(tx, f.counterparty, hit.category, 0.75, Source.RULE, false)
-                        hit != null && p.confidence < 0.6 -> Categorised(tx, f.counterparty, hit.category, 0.6, Source.RULE, true)
-                        else -> Categorised(tx, f.counterparty, p.label, p.confidence, Source.MODEL, true)
+                        hit != null && hit.confidence == Confidence.HIGH -> Categorised(tx, f.counterparty, hit.category, 0.85, Source.RULE, false, f.text, f.numeric)
+                        hit != null && hit.category == p.label -> Categorised(tx, f.counterparty, hit.category, 0.75, Source.RULE, false, f.text, f.numeric)
+                        hit != null && p.confidence < 0.6 -> Categorised(tx, f.counterparty, hit.category, 0.6, Source.RULE, true, f.text, f.numeric)
+                        else -> Categorised(tx, f.counterparty, p.label, p.confidence, Source.MODEL, true, f.text, f.numeric)
                     }
                 }
+            }
+        }
+    }
+
+    /** Plain-language reasons for one row's category ("Why?"). */
+    fun explain(item: Categorised, classifier: TransactionClassifier): List<String> {
+        val who = if (item.tx.txGroup in personGroups) "person" else "merchant"
+        return when (item.source) {
+            Source.USER -> listOf("You told me this $who is “${item.category}”, so I use that for every payment to them.")
+            Source.KNOWN -> listOf("You labelled this merchant as “${item.category}” earlier.")
+            Source.PATTERN -> listOf(item.why, "If this is not what it looks like, change it once and I will remember.")
+            Source.RULE -> listOf("The name matches a keyword rule" + (Rules.suggest(item.tx.txGroup, item.tx.name)?.let { ": ${it.why}" } ?: "") + ".",
+                "I am ${"%.0f".format(item.confidence * 100)}% sure." + if (item.needsReview) " Please confirm." else "")
+            Source.MODEL -> {
+                if (item.text.isEmpty()) return listOf("I am ${"%.0f".format(item.confidence * 100)}% sure.")
+                val e = classifier.explain(item.text, item.numeric)
+                val lines = ArrayList<String>()
+                lines.add("I think “${item.category}” (${"%.0f".format(item.confidence * 100)}% sure) rather than “${e.runnerUp}” because:")
+                if (e.reasons.isEmpty()) lines.add("• no single clear signal; it is a close call")
+                e.reasons.forEach { lines.add("• " + it.detail.replaceFirstChar { c -> c.uppercase() }) }
+                lines
             }
         }
     }
@@ -117,7 +153,7 @@ object ReviewEngine {
     fun reviewQueue(items: List<Categorised>): List<ReviewItem> =
         items.filter { it.needsReview }.groupBy { it.counterparty }.map { (cp, rows) ->
             val best = rows.maxByOrNull { it.confidence }!!
-            ReviewItem(cp, Counterparty.displayName(rows[0].tx), rows.size, rows.sumOf { it.tx.amount }, best.category, best.confidence)
+            ReviewItem(cp, Counterparty.displayName(rows[0].tx), rows.size, rows.sumOf { it.tx.amount }, best.category, best.confidence, rows[0].tx.txGroup in personGroups)
         }.sortedByDescending { it.totalAmount }
 
     fun summarise(items: List<Categorised>): Summary {
